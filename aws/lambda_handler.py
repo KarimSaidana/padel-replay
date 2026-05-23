@@ -1,41 +1,16 @@
 """
-Padel Replay Lambda Handler
-Handles clip creation, web UI serving, and metadata queries
+Padel Replay Lambda Handler - web UI and clip listing only.
+All clip creation is handled by cloud_recorder.py on EC2.
 """
-
 import json
 import os
-import subprocess
+from datetime import datetime
+
 import boto3
-import uuid
-from datetime import datetime, timedelta
 
-# AWS Clients (control-plane only — media clients need per-stream endpoints)
-kinesis_client = boto3.client("kinesisvideo")
-s3_client = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
-
-# Environment
-KVS_STREAM_NAME = os.environ["KVS_STREAM_NAME"]
-S3_BUCKET = os.environ["S3_BUCKET"]
+dynamodb       = boto3.resource("dynamodb")
 DYNAMODB_TABLE = os.environ["DYNAMODB_TABLE"]
-LAMBDA_AUTH_TOKEN = os.environ["LAMBDA_AUTH_TOKEN"]
-# Lambda sets AWS_REGION automatically; APP_REGION is our CloudFormation alias
-REGION = os.environ.get("APP_REGION") or os.environ.get("AWS_REGION", "us-east-1")
-
-FFMPEG = "/opt/bin/ffmpeg"
-WATERMARK = "/var/task/watermark.png"  # bundled in Lambda zip
-
-table = dynamodb.Table(DYNAMODB_TABLE)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def auth_check(headers):
-    token = headers.get("authorization", "").replace("Bearer ", "")
-    return token == LAMBDA_AUTH_TOKEN
+table          = dynamodb.Table(DYNAMODB_TABLE)
 
 
 def http_response(status_code, body):
@@ -56,213 +31,40 @@ def html_response(html):
     }
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# KVS — GET LAST 30 SECONDS AS MP4
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def get_clip_from_kvs():
-    """
-    Uses GetClip (archived-media API) to pull the last 30 seconds from the
-    Kinesis Video Stream. Returns raw MP4 bytes or None on failure.
-
-    GetClip is the correct API for this: it returns a self-contained MP4 that
-    covers a requested time range. GetMedia (with StartSelectorType: NOW)
-    would only deliver future frames and is not suitable here.
-    """
+def get_clips(limit=20):
     try:
-        # Each stream has its own endpoint — fetch it first
-        ep_response = kinesis_client.get_data_endpoint(
-            StreamName=KVS_STREAM_NAME,
-            APIName="GET_CLIP",
-        )
-        endpoint = ep_response["DataEndpoint"]
-
-        archived = boto3.client("kinesis-video-archived-media", endpoint_url=endpoint)
-
-        now = datetime.utcnow()
-        start = now - timedelta(seconds=35)  # 5 s extra so we always have 30 s
-
-        response = archived.get_clip(
-            StreamName=KVS_STREAM_NAME,
-            ClipFragmentSelector={
-                "FragmentSelectorType": "SERVER_TIMESTAMP",
-                "TimestampRange": {
-                    "StartTimestamp": start,
-                    "EndTimestamp": now,
-                },
-            },
-        )
-
-        video_bytes = response["Payload"].read()
-        print(f"[kvs] Retrieved {len(video_bytes):,} bytes from KVS")
-        return video_bytes if video_bytes else None
-
+        items = table.scan(Limit=limit).get("Items", [])
+        for c in items:
+            if "timestamp" in c:
+                c["timestamp"] = int(c["timestamp"])
+        items.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return items
     except Exception as e:
-        print(f"[kvs] Error retrieving clip: {e}")
-        return None
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ENCODE + UPLOAD
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def encode_and_upload(video_bytes, filename):
-    """
-    GetClip already returns an MP4 container.  We still pipe it through FFmpeg
-    to add -movflags +faststart (web streaming) and optionally burn the
-    watermark.  Returns {"filename", "s3_url"} or None on failure.
-    """
-    uid = uuid.uuid4().hex[:8]
-    input_path = f"/tmp/{uid}_in.mp4"
-    output_path = f"/tmp/{filename}"
-
-    try:
-        with open(input_path, "wb") as f:
-            f.write(video_bytes)
-
-        has_watermark = os.path.isfile(WATERMARK)
-
-        if has_watermark:
-            cmd = [
-                FFMPEG, "-y",
-                "-i", input_path,
-                "-i", WATERMARK,
-                "-filter_complex", "[1:v]scale=200:200[wm];[0:v][wm]overlay=0:0[out]",
-                "-map", "[out]",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                "-movflags", "+faststart",
-                "-an",
-                output_path,
-            ]
-        else:
-            cmd = [
-                FFMPEG, "-y",
-                "-i", input_path,
-                "-c:v", "copy",
-                "-movflags", "+faststart",
-                "-an",
-                output_path,
-            ]
-
-        result = subprocess.run(cmd, capture_output=True, timeout=90)
-        if result.returncode != 0:
-            print(f"[ffmpeg] Error: {result.stderr.decode()[-500:]}")
-            return None
-
-        with open(output_path, "rb") as f:
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=f"replays/{filename}",
-                Body=f.read(),
-                ContentType="video/mp4",
-                ACL="public-read",
-            )
-
-        s3_url = f"https://{S3_BUCKET}.s3.{REGION}.amazonaws.com/replays/{filename}"
-        print(f"[s3] Uploaded: {s3_url}")
-        return {"filename": filename, "s3_url": s3_url}
-
-    except Exception as e:
-        print(f"[encode] Error: {e}")
-        return None
-
-    finally:
-        for p in (input_path, output_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DYNAMODB
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def save_clip_metadata(clip_id, filename, s3_url, action="button"):
-    try:
-        ts = int(datetime.utcnow().timestamp() * 1000)
-        table.put_item(
-            Item={
-                "clip_id": clip_id,
-                "timestamp": ts,
-                "filename": filename,
-                "s3_url": s3_url,
-                "action": action,
-                "created_at": datetime.utcnow().isoformat(),
-                "ttl": int(datetime.utcnow().timestamp()) + 90 * 24 * 3600,
-            }
-        )
-        return True
-    except Exception as e:
-        print(f"[dynamo] Error saving metadata: {e}")
-        return False
-
-
-def get_clips_from_db(limit=20):
-    try:
-        response = table.scan(Limit=limit)
-        clips = response.get("Items", [])
-        clips.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-        return clips
-    except Exception as e:
-        print(f"[dynamo] Error querying clips: {e}")
+        print(f"[dynamo] Error: {e}")
         return []
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ROUTES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def route_health():
-    clips_count = len(get_clips_from_db(limit=1000))
+    clips = get_clips(limit=1000)
     return http_response(200, {
-        "status": "ok",
-        "stream": KVS_STREAM_NAME,
-        "clips": clips_count,
+        "status":    "ok",
+        "clips":     len(clips),
         "timestamp": datetime.utcnow().isoformat(),
     })
 
 
-def route_trigger(headers, body):
-    if not auth_check(headers):
-        return http_response(401, {"error": "Unauthorized"})
-
-    print("[trigger] Button press received")
-
-    video_bytes = get_clip_from_kvs()
-    if not video_bytes:
-        return http_response(503, {"error": "No video data available from KVS"})
-
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    clip_id = f"replay_{ts}_{uuid.uuid4().hex[:8]}"
-    filename = f"{clip_id}.mp4"
-
-    result = encode_and_upload(video_bytes, filename)
-    if not result:
-        return http_response(500, {"error": "Encoding or upload failed"})
-
-    save_clip_metadata(clip_id, result["filename"], result["s3_url"], action="button")
-
-    print(f"[trigger] Done: {clip_id}")
-    return http_response(200, {
-        "clip_id": clip_id,
-        "s3_url": result["s3_url"],
-        "filename": result["filename"],
-    })
-
-
 def route_clips():
-    clips = get_clips_from_db(limit=100)
+    clips = get_clips(limit=100)
     return http_response(200, {"clips": clips, "count": len(clips)})
 
 
 def route_index():
-    clips = get_clips_from_db(limit=20)
+    clips = get_clips(limit=20)
 
     if clips:
         cards = ""
         for i, clip in enumerate(clips):
-            ts = datetime.fromtimestamp(clip["timestamp"] / 1000).strftime("%b %d · %H:%M:%S")
+            ts  = datetime.fromtimestamp(clip["timestamp"] / 1000).strftime("%b %d  %H:%M:%S")
             url = clip["s3_url"]
             name = clip.get("filename", "replay.mp4")
             cards += f"""
@@ -298,7 +100,6 @@ def route_index():
 <head>
   <title>Padel Replay Feed</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="5" />
   <style>
     :root {{
       --bg: #07130f; --panel: #0f2019; --border: rgba(255,255,255,0.1);
@@ -402,7 +203,7 @@ def route_index():
       </div>
       <div class="status">
         <span class="dot"></span>
-        System live · Auto-refresh 5s
+        System live &middot; Auto-refresh 5s
       </div>
     </div>
   </header>
@@ -428,11 +229,15 @@ def route_index():
     {grid_section}
   </main>
   <script>
+    setInterval(() => {{
+      const playing = [...document.querySelectorAll('video')].some(v => !v.paused);
+      if (!playing) location.reload();
+    }}, 10000);
     async function shareClip(url) {{
       try {{
         if (navigator.share) {{ await navigator.share({{ title: 'Padel Replay', url }}); return; }}
         await navigator.clipboard.writeText(url);
-        alert('Link copied — paste on WhatsApp, Instagram, or anywhere.');
+        alert('Link copied - paste on WhatsApp, Instagram, or anywhere.');
       }} catch {{
         try {{ await navigator.clipboard.writeText(url); alert('Link copied.'); }}
         catch {{ alert('Sharing not available.'); }}
@@ -441,29 +246,19 @@ def route_index():
   </script>
 </body>
 </html>"""
-
     return html_response(html)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MAIN HANDLER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def handler(event, context):
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
-    path = event.get("rawPath", "/")
-    headers = event.get("headers", {})
-    body = event.get("body", "")
-
+    path   = event.get("rawPath", "/")
     print(f"[handler] {method} {path}")
 
     if path == "/" and method == "GET":
         return route_index()
-    elif path == "/health" and method == "GET":
+    elif path == "/health":
         return route_health()
-    elif path == "/trigger" and method == "POST":
-        return route_trigger(headers, body)
-    elif path == "/clips" and method == "GET":
+    elif path == "/clips":
         return route_clips()
     else:
         return http_response(404, {"error": "Not found"})

@@ -1,33 +1,24 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Padel Replay Cloud System - Kinesis, Lambda, S3, DynamoDB, API Gateway"
+Description: "Padel Replay - S3, DynamoDB, Lambda (web UI), EC2 cloud recorder"
 
 Parameters:
   EnvironmentName:
     Type: String
     Default: padel-replay
-    Description: Environment name for resource naming
   LambdaAuthToken:
     Type: String
     NoEcho: true
-    Description: Shared secret for local-to-Lambda authentication
-  FFmpegLayerArn:
+    Description: Shared secret for Lambda (web UI auth, kept for compatibility)
+  RecorderAuthToken:
     Type: String
-    Description: ARN of FFmpeg Lambda layer (deploy separately)
+    NoEcho: true
+    Description: Shared secret for EC2 cloud recorder /save endpoint
 
 Resources:
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # KINESIS VIDEO STREAM (Camera Feed Buffering)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  PadelReplayStream:
-    Type: AWS::KinesisVideo::Stream
-    Properties:
-      Name: !Sub "${EnvironmentName}-stream"
-      DataRetentionInHours: 24
-      MediaType: "video/h264"
 
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # S3 BUCKET (Video Clip Storage)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------
+  # S3 BUCKET
+  # ------------------------------------------------------------
   PadelClipsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -59,9 +50,9 @@ Resources:
             Action: s3:GetObject
             Resource: !Sub "${PadelClipsBucket.Arn}/*"
 
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # DYNAMODB TABLE (Clip Metadata)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------
+  # DYNAMODB
+  # ------------------------------------------------------------
   PadelClipsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -88,9 +79,9 @@ Resources:
         AttributeName: ttl
         Enabled: true
 
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # IAM ROLE (Lambda Execution)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------
+  # LAMBDA (web UI only)
+  # ------------------------------------------------------------
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -104,38 +95,18 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: PadelReplayAccess
+        - PolicyName: LambdaDynamoRead
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - kinesisvideo:GetDataEndpoint
-                  - kinesisvideo:GetMedia
-                Resource: !GetAtt PadelReplayStream.Arn
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                Resource: !Sub "${PadelClipsBucket.Arn}/*"
-              - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:Query
                   - dynamodb:Scan
+                  - dynamodb:Query
                 Resource:
                   - !GetAtt PadelClipsTable.Arn
                   - !Sub "${PadelClipsTable.Arn}/index/*"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
 
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # LAMBDA FUNCTION (Main Handler)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
   PadelReplayFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -143,40 +114,30 @@ Resources:
       Runtime: python3.11
       Handler: lambda_handler.handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 120
-      MemorySize: 2048
-      Layers:
-        - !Ref FFmpegLayerArn
+      Timeout: 30
+      MemorySize: 256
       Environment:
         Variables:
-          KVS_STREAM_NAME: !Sub "${EnvironmentName}-stream"
-          S3_BUCKET: !Ref PadelClipsBucket
           DYNAMODB_TABLE: !Ref PadelClipsTable
           LAMBDA_AUTH_TOKEN: !Ref LambdaAuthToken
           APP_REGION: !Ref AWS::Region
       Code:
         ZipFile: |
-          # Placeholder - will be replaced with actual code
           def handler(event, context):
               return {"statusCode": 200, "body": "placeholder"}
 
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  # API GATEWAY (HTTP API)
-  # ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------
+  # API GATEWAY
+  # ------------------------------------------------------------
   PadelReplayApi:
     Type: AWS::ApiGatewayV2::Api
     Properties:
       Name: !Sub "${EnvironmentName}-api"
       ProtocolType: HTTP
       CorsConfiguration:
-        AllowOrigins:
-          - "*"
-        AllowMethods:
-          - GET
-          - POST
-          - HEAD
-        AllowHeaders:
-          - "*"
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, HEAD]
+        AllowHeaders: ["*"]
 
   ApiIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -215,18 +176,165 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PadelReplayApi}/*"
 
+  # ------------------------------------------------------------
+  # EC2 - CLOUD RECORDER
+  # ------------------------------------------------------------
+  RecorderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Padel cloud recorder
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1935
+          ToPort: 1935
+          CidrIp: 0.0.0.0/0
+          Description: RTMP ingest from local stream relay
+        - IpProtocol: tcp
+          FromPort: 8554
+          ToPort: 8554
+          CidrIp: 0.0.0.0/0
+          Description: RTSP ingest (MediaMTX fallback)
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+          Description: Flask API for /save and /health
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+
+  RecorderIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: RecorderAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub "${PadelClipsBucket.Arn}/*"
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt PadelClipsTable.Arn
+                  - !Sub "${PadelClipsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::padel-deploy-${AWS::AccountId}-${AWS::Region}/*"
+
+  RecorderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref RecorderIAMRole]
+
+  RecorderInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      IamInstanceProfile: !Ref RecorderInstanceProfile
+      SecurityGroups: [!Ref RecorderSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-recorder"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          yum update -y
+          yum install -y python3 python3-pip tar wget mesa-libGL libGL
+
+          # Static FFmpeg
+          cd /tmp
+          wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar xf ffmpeg-release-amd64-static.tar.xz
+          cp ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg
+          chmod +x /usr/local/bin/ffmpeg
+          rm -rf /tmp/ffmpeg-*
+
+          # MediaMTX (RTMP server)
+          mkdir -p /opt/mediamtx && cd /opt/mediamtx
+          MTX_VER=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+          wget -q "https://github.com/bluenviron/mediamtx/releases/download/${!MTX_VER}/mediamtx_${!MTX_VER}_linux_amd64.tar.gz"
+          tar xf mediamtx_*.tar.gz && chmod +x mediamtx
+
+          # Python packages
+          pip3 install --quiet flask boto3 opencv-python-headless numpy
+
+          # App directory + env file
+          mkdir -p /opt/padel-recorder
+          cat > /opt/padel-recorder/env << ENVEOF
+          S3_BUCKET=${PadelClipsBucket}
+          DYNAMODB_TABLE=${PadelClipsTable}
+          RECORDER_AUTH_TOKEN=${RecorderAuthToken}
+          AWS_DEFAULT_REGION=${AWS::Region}
+          RTMP_URL=rtmp://localhost:1935/live/stream
+          ENVEOF
+
+          # MediaMTX systemd service
+          cat > /etc/systemd/system/mediamtx.service << 'SVCEOF'
+          [Unit]
+          Description=MediaMTX RTMP Server
+          After=network.target
+          [Service]
+          Type=simple
+          ExecStart=/opt/mediamtx/mediamtx
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          # Cloud recorder systemd service
+          cat > /etc/systemd/system/padel-recorder.service << 'SVCEOF'
+          [Unit]
+          Description=Padel Cloud Recorder
+          After=network.target mediamtx.service
+          [Service]
+          Type=simple
+          EnvironmentFile=/opt/padel-recorder/env
+          WorkingDirectory=/opt/padel-recorder
+          ExecStart=/usr/bin/python3 /opt/padel-recorder/cloud_recorder.py
+          Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable mediamtx
+          systemctl start mediamtx
+          systemctl enable padel-recorder
+          # padel-recorder starts after deploy.ps1 copies cloud_recorder.py
+
+  RecorderEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref RecorderInstance
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-recorder-ip"
+
 Outputs:
   ApiEndpoint:
-    Description: API Gateway endpoint URL
+    Description: Lambda web UI URL
     Value: !Sub "https://${PadelReplayApi}.execute-api.${AWS::Region}.amazonaws.com"
     Export:
       Name: !Sub "${EnvironmentName}-api-endpoint"
-
-  KinesisStreamName:
-    Description: Kinesis Video Stream name
-    Value: !Sub "${EnvironmentName}-stream"
-    Export:
-      Name: !Sub "${EnvironmentName}-stream-name"
 
   S3BucketName:
     Description: S3 bucket for clips
@@ -235,8 +343,13 @@ Outputs:
       Name: !Sub "${EnvironmentName}-bucket"
 
   DynamoDBTable:
-    Description: DynamoDB table for metadata
+    Description: DynamoDB table
     Value: !Ref PadelClipsTable
     Export:
       Name: !Sub "${EnvironmentName}-table"
 
+  RecorderPublicIP:
+    Description: EC2 recorder public IP
+    Value: !Ref RecorderEIP
+    Export:
+      Name: !Sub "${EnvironmentName}-recorder-ip"

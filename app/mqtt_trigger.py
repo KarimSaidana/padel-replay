@@ -1,7 +1,6 @@
 """
-Padel Replay - Local MQTT Trigger Service
-Listens for Zigbee button presses and calls Lambda API
-Runs on court machine only (~50MB RAM)
+Padel Replay - Local MQTT Trigger
+Listens for Zigbee button presses and calls Lambda to create a clip.
 """
 
 import json
@@ -9,100 +8,98 @@ import os
 import time
 import requests
 import paho.mqtt.client as mqtt
+from datetime import datetime
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Load environment
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Config
-MQTT_URL = os.getenv("MQTT_URL", "mqtt://localhost:1883").replace("mqtt://", "")
-BUTTON_TOPIC = os.getenv("BUTTON_TOPIC", "zigbee2mqtt/padel_button")
-LAMBDA_URL = os.getenv("LAMBDA_URL", "http://localhost:8000")
-LAMBDA_AUTH_TOKEN = os.getenv("LAMBDA_AUTH_TOKEN", "dev-token")
+MQTT_URL       = os.getenv("MQTT_URL", "mqtt://localhost:1883").replace("mqtt://", "")
+BUTTON_TOPIC   = os.getenv("BUTTON_TOPIC", "zigbee2mqtt/padel_button")
+EC2_URL        = os.getenv("EC2_URL", "http://localhost:5000")
+AUTH_TOKEN     = os.getenv("RECORDER_AUTH_TOKEN", "dev-token")
 
 MQTT_PARTS = MQTT_URL.split(":")
-MQTT_HOST = MQTT_PARTS[0]
-MQTT_PORT = int(MQTT_PARTS[1]) if len(MQTT_PARTS) > 1 else 1883
+MQTT_HOST  = MQTT_PARTS[0]
+MQTT_PORT  = int(MQTT_PARTS[1]) if len(MQTT_PARTS) > 1 else 1883
 
-# State
-_last_trigger = 0.0
+_last_trigger    = 0.0
 _debounce_seconds = 2.0
 
 
 def trigger_lambda(action="button"):
-    """Call Lambda /trigger endpoint"""
     global _last_trigger
-
     now = time.time()
     if now - _last_trigger < _debounce_seconds:
-        print(f"[debounce] Ignoring trigger (last: {now - _last_trigger:.1f}s ago)")
         return
-
     _last_trigger = now
 
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"\n{'='*50}", flush=True)
+    print(f"  BUTTON PRESSED  [{ts}]  action={action}", flush=True)
+    print(f"{'='*50}", flush=True)
+    print(f"  Calling EC2 recorder... (saving last 30s)", flush=True)
+
     try:
-        print(f"[mqtt] Button pressed: {action}")
         response = requests.post(
-            f"{LAMBDA_URL}/trigger",
-            headers={"Authorization": f"Bearer {LAMBDA_AUTH_TOKEN}"},
+            f"{EC2_URL}/save",
+            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
             json={"action": action},
-            timeout=5,
+            timeout=120,
         )
 
         if response.status_code == 200:
             data = response.json()
-            print(f"[lambda] Clip created: {data.get('clip_id')}")
-            print(f"[lambda] S3 URL: {data.get('s3_url')}")
+            print(f"  Clip created:  {data.get('clip_id')}", flush=True)
+            print(f"  Watch it here: {data.get('s3_url')}", flush=True)
+            print(f"{'='*50}\n", flush=True)
+        elif response.status_code == 503:
+            print(f"  ERROR: Buffer empty on EC2.", flush=True)
+            print(f"  Is the Stream Relay running and connected?", flush=True)
+            print(f"{'='*50}\n", flush=True)
         else:
-            print(f"[lambda] Error: {response.status_code} - {response.text}")
+            print(f"  ERROR: Lambda returned {response.status_code}", flush=True)
+            print(f"  {response.text[:300]}", flush=True)
+            print(f"{'='*50}\n", flush=True)
 
     except requests.exceptions.Timeout:
-        print("[lambda] Timeout - Lambda may be encoding previous clip")
+        print(f"  ERROR: Lambda timed out after 120s", flush=True)
+        print(f"{'='*50}\n", flush=True)
     except Exception as e:
-        print(f"[lambda] Error: {e}")
+        print(f"  ERROR: {e}", flush=True)
+        print(f"{'='*50}\n", flush=True)
 
 
 def on_connect(client, userdata, flags, rc):
-    """MQTT connect callback"""
     if rc == 0:
-        print(f"[mqtt] Connected to {MQTT_HOST}:{MQTT_PORT}")
         client.subscribe(BUTTON_TOPIC)
-        print(f"[mqtt] Subscribed to: {BUTTON_TOPIC}")
+        print(f"[mqtt] Connected - listening on: {BUTTON_TOPIC}", flush=True)
+        print(f"[mqtt] Waiting for button press...\n", flush=True)
     else:
-        print(f"[mqtt] Connection failed: rc={rc}")
+        print(f"[mqtt] Connection failed (rc={rc}) - retrying...", flush=True)
 
 
 def on_message(client, userdata, msg):
-    """MQTT message callback"""
     try:
         payload = json.loads(msg.payload.decode())
-        action = str(payload.get("action", "")).lower()
-
-        # Detect button actions
-        if any(x in action for x in ["single", "double", "long", "hold"]):
+        action  = str(payload.get("action", "")).lower()
+        if action:
+            print(f"[mqtt] Received action: '{action}'", flush=True)
+        if any(x in action for x in ["single", "double", "long", "hold", "click", "toggle", "on", "press"]):
             trigger_lambda(action)
-        else:
-            print(f"[mqtt] Ignoring action: {action}")
-
-    except json.JSONDecodeError:
-        print(f"[mqtt] Invalid JSON: {msg.payload}")
-    except Exception as e:
-        print(f"[mqtt] Error processing message: {e}")
+    except Exception:
+        pass
 
 
 def main():
-    """Start MQTT listener"""
-    print("\n" + "=" * 60)
-    print("PADEL REPLAY - LOCAL MQTT TRIGGER")
-    print("=" * 60)
-    print(f"MQTT Broker: {MQTT_HOST}:{MQTT_PORT}")
-    print(f"Button Topic: {BUTTON_TOPIC}")
-    print(f"Lambda URL: {LAMBDA_URL}")
-    print(f"Debounce: {_debounce_seconds}s")
-    print("=" * 60 + "\n")
+    print(f"\n{'='*50}", flush=True)
+    print(f"  PADEL REPLAY - MQTT TRIGGER", flush=True)
+    print(f"{'='*50}", flush=True)
+    print(f"  Broker:  {MQTT_HOST}:{MQTT_PORT}", flush=True)
+    print(f"  Topic:   {BUTTON_TOPIC}", flush=True)
+    print(f"  EC2:     {EC2_URL}", flush=True)
+    print(f"{'='*50}\n", flush=True)
 
-    # Create MQTT client
     try:
         from paho.mqtt.enums import CallbackAPIVersion
         client = mqtt.Client(CallbackAPIVersion.VERSION1)
@@ -115,20 +112,13 @@ def main():
     try:
         client.connect_async(MQTT_HOST, MQTT_PORT)
         client.loop_start()
-        print("[mqtt] Listening for button presses... (Ctrl+C to stop)\n")
-
-        # Keep running
         while True:
             time.sleep(1)
-
     except KeyboardInterrupt:
-        print("\n[mqtt] Shutting down...")
-    except Exception as e:
-        print(f"[mqtt] Fatal error: {e}")
+        print("\n[mqtt] Stopped.")
     finally:
         client.loop_stop()
         client.disconnect()
-        print("[mqtt] Disconnected")
 
 
 if __name__ == "__main__":
