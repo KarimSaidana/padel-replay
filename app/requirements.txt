@@ -1,5 +1,3 @@
-flask
-opencv-python
 paho-mqtt
-boto3
+requests
 python-dotenv

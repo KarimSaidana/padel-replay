@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Padel Replay Cloud System - Kinesis, Lambda, S3, DynamoDB, API Gateway"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: padel-replay
+    Description: Environment name for resource naming
+  LambdaAuthToken:
+    Type: String
+    NoEcho: true
+    Description: Shared secret for local-to-Lambda authentication
+  FFmpegLayerArn:
+    Type: String
+    Description: ARN of FFmpeg Lambda layer (deploy separately)
+
+Resources:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # KINESIS VIDEO STREAM (Camera Feed Buffering)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PadelReplayStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: !Sub "${EnvironmentName}-stream"
+      DataRetentionInHours: 24
+      DeviceCount: 1
+      MediaType: "video/h264"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # S3 BUCKET (Video Clip Storage)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PadelClipsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-clips-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3600
+
+  PadelClipsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PadelClipsBucket
+      PolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${PadelClipsBucket.Arn}/*"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # DYNAMODB TABLE (Clip Metadata)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PadelClipsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-clips"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: clip_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: clip_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # IAM ROLE (Lambda Execution)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PadelReplayAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesisvideo:GetDataEndpoint
+                  - kinesisvideo:GetMedia
+                Resource: !GetAtt PadelReplayStream.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${PadelClipsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PadelClipsTable.Arn
+                  - !Sub "${PadelClipsTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # LAMBDA FUNCTION (Main Handler)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PadelReplayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-handler"
+      Runtime: python3.11
+      Handler: lambda_handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 2048
+      Layers:
+        - !Ref FFmpegLayerArn
+      Environment:
+        Variables:
+          KVS_STREAM_NAME: !Sub "${EnvironmentName}-stream"
+          S3_BUCKET: !Ref PadelClipsBucket
+          DYNAMODB_TABLE: !Ref PadelClipsTable
+          LAMBDA_AUTH_TOKEN: !Ref LambdaAuthToken
+          AWS_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          def handler(event, context):
+              return {"statusCode": 200, "body": "placeholder"}
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # API GATEWAY (HTTP API)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PadelReplayApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${EnvironmentName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - HEAD
+        AllowHeaders:
+          - "*"
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PadelReplayApi
+      IntegrationType: AWS_LAMBDA
+      IntegrationUri: !Sub "arn:aws:apigatewayv2:${AWS::Region}:lambda:path/2015-03-31/functions/${PadelReplayFunction.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PadelReplayApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  RootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PadelReplayApi
+      RouteKey: "GET /"
+      Target: !Sub "integrations/${ApiIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PadelReplayApi
+      StageName: live
+      AutoDeploy: true
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PadelReplayFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PadelReplayApi}/*"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${PadelReplayApi}.lambda-url.${AWS::Region}.on.aws"
+    Export:
+      Name: !Sub "${EnvironmentName}-api-endpoint"
+
+  KinesisStreamName:
+    Description: Kinesis Video Stream name
+    Value: !Sub "${EnvironmentName}-stream"
+    Export:
+      Name: !Sub "${EnvironmentName}-stream-name"
+
+  S3BucketName:
+    Description: S3 bucket for clips
+    Value: !Ref PadelClipsBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-bucket"
+
+  DynamoDBTable:
+    Description: DynamoDB table for metadata
+    Value: !Ref PadelClipsTable
+    Export:
+      Name: !Sub "${EnvironmentName}-table"
