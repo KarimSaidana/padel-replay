@@ -9,11 +9,20 @@
 param(
     [string]$StackName  = "padel-replay",
     [string]$EnvName    = "padel-replay",
-    [string]$Region     = "us-east-1"
+    [string]$Region     = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Read region from .env if not passed as argument
+if (-not $Region) {
+    $envFile = Join-Path $PSScriptRoot ".." ".env"
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*AWS_REGION\s*=\s*(.+)$') { $Region = $Matches[1].Trim() }
+    }
+    if (-not $Region) { $Region = "us-east-1" }
+}
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 function Step { param([string]$msg) Write-Host "`n--- $msg ---" -ForegroundColor Cyan }
