@@ -455,6 +455,11 @@ def handler(event, context):
     headers = event.get("headers", {})
     body = event.get("body", "")
 
+    # API Gateway passes /stage-name/path for named stages — strip the prefix
+    stage = event.get("requestContext", {}).get("stage", "")
+    if stage and stage != "$default" and path.startswith(f"/{stage}"):
+        path = path[len(f"/{stage}"):] or "/"
+
     print(f"[handler] {method} {path}")
 
     if path == "/" and method == "GET":
