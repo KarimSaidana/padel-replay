@@ -51,7 +51,7 @@ Resources:
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref PadelClipsBucket
-      PolicyText:
+      PolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Sid: PublicReadGetObject
@@ -154,7 +154,7 @@ Resources:
           S3_BUCKET: !Ref PadelClipsBucket
           DYNAMODB_TABLE: !Ref PadelClipsTable
           LAMBDA_AUTH_TOKEN: !Ref LambdaAuthToken
-          AWS_REGION: !Ref AWS::Region
+          APP_REGION: !Ref AWS::Region
       Code:
         ZipFile: |
           # Placeholder - will be replaced with actual code
@@ -183,8 +183,8 @@ Resources:
     Type: AWS::ApiGatewayV2::Integration
     Properties:
       ApiId: !Ref PadelReplayApi
-      IntegrationType: AWS_LAMBDA
-      IntegrationUri: !Sub "arn:aws:apigatewayv2:${AWS::Region}:lambda:path/2015-03-31/functions/${PadelReplayFunction.Arn}/invocations"
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PadelReplayFunction.Arn
       PayloadFormatVersion: "2.0"
 
   ApiRoute:
@@ -219,7 +219,7 @@ Resources:
 Outputs:
   ApiEndpoint:
     Description: API Gateway endpoint URL
-    Value: !Sub "https://${PadelReplayApi}.lambda-url.${AWS::Region}.on.aws"
+    Value: !Sub "https://${PadelReplayApi}.execute-api.${AWS::Region}.amazonaws.com/live"
     Export:
       Name: !Sub "${EnvironmentName}-api-endpoint"
 
