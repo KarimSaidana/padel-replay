@@ -1,0 +1,5 @@
+flask
+opencv-python
+paho-mqtt
+boto3
+python-dotenv
